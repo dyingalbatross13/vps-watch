@@ -1,0 +1,85 @@
+name: vps-watch
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Send a test notification
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  NTFY_TOPIC: rachel-7k2m9qx4tb3
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Restore previous state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
+          restore-keys: |
+            state-
+
+      - name: Probe
+        id: probe
+        run: |
+          problems=""
+          probe_tcp() {
+            if ! timeout 10 bash -c "exec 3<>/dev/tcp/$1/$2" 2>/dev/null; then
+              problems="$problems $1:$2"
+            fi
+          }
+          probe_http() {
+            code=$(curl -s -o /dev/null -w '%{http_code}' -m 20 "$1" 2>/dev/null || echo 000)
+            case "$code" in
+              2*|3*) ;;
+              *) problems="$problems $1($code)" ;;
+            esac
+          }
+          probe_tcp mail.dyingalbatross.me 993
+          probe_tcp mail.dyingalbatross.me 587
+          probe_tcp mail.dyingalbatross.me 22
+          probe_http https://rachelayeung.com
+          problems=$(echo "$problems" | xargs)
+          echo "problems=$problems" >> "$GITHUB_OUTPUT"
+          echo "Problems: [$problems]"
+
+      - name: Notify on change
+        run: |
+          prev=$(cat state/last 2>/dev/null || echo up)
+          problems="${{ steps.probe.outputs.problems }}"
+          if [ -n "$problems" ]; then now=down; else now=up; fi
+          mkdir -p state && echo "$now" > state/last
+          send=no
+          if [ "$now" = down ] && [ "$prev" != down ]; then send=yes; fi
+          if [ "$now" = up ] && [ "$prev" = down ]; then send=yes; fi
+          if [ "${{ inputs.test }}" = "true" ]; then send=yes; fi
+          if [ "$send" = yes ]; then
+            if [ "${{ inputs.test }}" = "true" ] && [ "$now" = up ]; then
+              title="🔔 測試通知"
+              msg="ntfy 接得通，VPS 監控已經上線"
+            elif [ "$now" = down ]; then
+              title="⚠️ VPS 有嘢唔通"
+              msg="唔通：$problems"
+            else
+              title="✅ VPS 恢復正常"
+              msg="全部 endpoint 返晒嚟"
+            fi
+            curl -sS -m 20 -H "Title: $title" -H "Priority: 5" -H "Tags: warning" -d "$msg" "https://ntfy.sh/$NTFY_TOPIC"
+          else
+            echo "no change (prev=$prev now=$now)"
+          fi
+
+      - name: Save state
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: state-${{ github.run_id }}
